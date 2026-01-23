@@ -116,7 +116,7 @@ venv.bak/
 
 # mkdocs documentation
 /site
-
+/tmp
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -152,3 +152,4 @@ Desktop.ini
 
 fusion_result.json
 kernel_meta/
+ 

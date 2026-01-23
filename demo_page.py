@@ -9,7 +9,7 @@ import os
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, BitsAndBytesConfig
 from qwen_vl_utils import process_vision_info
 
 from utils.utils import *
@@ -17,24 +17,21 @@ from utils.utils import *
 
 class DOLPHIN:
     def __init__(self, model_id_or_path):
-        """Initialize the Hugging Face model
-        
-        Args:
-            model_id_or_path: Path to local model or Hugging Face model ID
-        """
-        # Load model from local path or Hugging Face hub
         self.processor = AutoProcessor.from_pretrained(model_id_or_path)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id_or_path)
-        self.model.eval()
-        
-        # Set device and precision
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
 
-        if self.device == "cuda":
-            self.model = self.model.bfloat16()
-        else:
-            self.model = self.model.float()
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id_or_path,
+            quantization_config=quantization_config,
+            device_map="auto",
+        )
+        self.model.eval()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         # set tokenizer
         self.tokenizer = self.processor.tokenizer
