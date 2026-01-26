@@ -16,3 +16,7 @@ bs4
 albumentations==1.4.0
 pymupdf==1.26
 bitsandbytes
+
+fastapi
+uvicorn
+python-multipart
