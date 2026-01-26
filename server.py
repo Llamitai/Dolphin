@@ -100,13 +100,7 @@ async def extract(file: UploadFile = File(...)):
 
     width, height = image.size
 
-    prompt = """Please parse the reading order of this document. Follow the order of human reading, from top to bottom, and from left to right.
-You need to output the content of all text blocks, following the format:
-<BLOCK id=x type=TYPE>
-the text content of this block
-</BLOCK>
-Possible values for TYPE are: paragraph, title, subtitle, header, footer, table, figure, caption, equation, list.
-"""
+    prompt = "Parse the reading order of this document."
 
     response = chat(prompt, image)
     elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -123,18 +117,42 @@ Possible values for TYPE are: paragraph, title, subtitle, header, footer, table,
 
 
 def parse_response(response: str, width: int, height: int) -> list:
+    """Parse Dolphin response format: [x1,y1,x2,y2][type][PAIR_SEP]..."""
     blocks = []
-    pattern = r'<BLOCK\s+id=(\d+)\s+type=(\w+)>(.*?)</BLOCK>'
-    matches = re.findall(pattern, response, re.DOTALL)
 
-    for block_id, block_type, content in matches:
-        blocks.append({
-            "id": int(block_id),
-            "type": block_type.lower(),
-            "text": content.strip(),
-            "bbox": [0, 0, width, height],
-            "confidence": 1.0,
-        })
+    type_map = {
+        "para": "paragraph",
+        "title": "title",
+        "fig": "figure",
+        "table": "table",
+        "list": "list",
+        "foot": "footer",
+        "head": "header",
+        "caption": "caption",
+        "equation": "formula",
+    }
+
+    parts = response.split("[PAIR_SEP]")
+
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+
+        pattern = r'\[(\d+),(\d+),(\d+),(\d+)\]\[(\w+)\]'
+        match = re.match(pattern, part)
+
+        if match:
+            x1, y1, x2, y2, block_type = match.groups()
+            normalized_type = type_map.get(block_type.lower(), block_type.lower())
+
+            blocks.append({
+                "id": i,
+                "type": normalized_type,
+                "text": "",
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "confidence": 1.0,
+            })
 
     return blocks
 
