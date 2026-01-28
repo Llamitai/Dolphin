@@ -10,16 +10,17 @@ from fastapi.responses import JSONResponse
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, BitsAndBytesConfig         
 from qwen_vl_utils import process_vision_info                                                          
                                                                                                         
-from utils.utils import resize_img                                                                     
+from utils.utils import resize_img, parse_layout_string, process_coordinates                           
                                                                                                         
 app = FastAPI(title="Dolphin OCR Server")                                                              
                                                                                                         
 model = None                                                                                           
 processor = None                                                                                       
+tokenizer = None                                                                                       
                                                                                                         
                                                                                                         
 def load_model():                                                                                      
-    global model, processor                                                                            
+    global model, processor, tokenizer                                                                 
     model_path = os.environ.get("MODEL_PATH", "./hf_model")                                            
     print(f"Loading Dolphin model from {model_path}...")                                               
                                                                                                         
@@ -37,6 +38,10 @@ def load_model():
         device_map="auto",                                                                             
     )                                                                                                  
     model.eval()                                                                                       
+                                                                                                        
+    tokenizer = processor.tokenizer                                                                    
+    tokenizer.padding_side = "left"                                                                    
+                                                                                                        
     print(f"Model loaded on {'cuda' if torch.cuda.is_available() else 'cpu'}")                         
                                                                                                         
                                                                                                         
@@ -66,7 +71,7 @@ def chat(prompt: str, image: Image.Image) -> str:
     with torch.no_grad():                                                                              
         generated_ids = model.generate(                                                                
             **inputs,                                                                                  
-            max_new_tokens=8192,                                                                       
+            max_new_tokens=4096,                                                                       
             do_sample=False,                                                                           
         )                                                                                              
                                                                                                         
@@ -100,89 +105,67 @@ async def extract(file: UploadFile = File(...)):
                                                                                                         
     width, height = image.size                                                                         
                                                                                                         
-    prompt = """Parse this document and extract all text with their bounding boxes.                    
-For each text element, output in this exact format:                                                    
-[x1,y1,x2,y2][type]text content here[/type][PAIR_SEP]                                                  
+    # Stage 1: Layout parsing                                                                          
+    layout_output = chat("Parse the reading order of this document.", image)                           
+    layout_results_list = parse_layout_string(layout_output)                                           
                                                                                                         
-Where type is one of: para, title, fig, table, list, foot, head, caption, equation                     
+    if not layout_results_list or not (layout_output.startswith("[") and layout_output.endswith("]")): 
+        layout_results_list = [([0, 0, width, height], "distorted_page", [])]                          
                                                                                                         
-Extract ALL text visible in the document."""                                                           
+    # Stage 2: Extract text from each block                                                            
+    blocks = []                                                                                        
+    all_texts = []                                                                                     
                                                                                                         
-    response = chat(prompt, image)                                                                     
+    for i, (bbox, label, tags) in enumerate(layout_results_list):                                      
+        try:                                                                                           
+            if label == "distorted_page":                                                              
+                x1, y1, x2, y2 = 0, 0, width, height                                                   
+                pil_crop = image                                                                       
+            else:                                                                                      
+                x1, y1, x2, y2 = process_coordinates(bbox, image)                                      
+                pil_crop = image.crop((x1, y1, x2, y2))                                                
+                                                                                                        
+            if pil_crop.size[0] <= 3 or pil_crop.size[1] <= 3:                                         
+                continue                                                                               
+                                                                                                        
+            if label == "fig":                                                                         
+                text = "[Figure]"                                                                      
+            elif label == "tab":                                                                       
+                text = chat("Parse the table in the image.", pil_crop)                                 
+            elif label == "equ":                                                                       
+                text = chat("Read formula in the image.", pil_crop)                                    
+            elif label == "code":                                                                      
+                text = chat("Read code in the image.", pil_crop)                                       
+            else:                                                                                      
+                text = chat("Read text in the image.", pil_crop)                                       
+                                                                                                        
+            text = text.strip() if text else ""                                                        
+            all_texts.append(text)                                                                     
+                                                                                                        
+            blocks.append({                                                                            
+                "id": i,                                                                               
+                "type": label,                                                                         
+                "text": text,                                                                          
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],                                          
+                "confidence": 1.0,                                                                     
+            })                                                                                         
+                                                                                                        
+        except Exception as e:                                                                         
+            print(f"Error processing block {label}: {e}")                                              
+            continue                                                                                   
+                                                                                                        
     elapsed_ms = (time.perf_counter() - start_time) * 1000                                             
-                                                                                                        
-    blocks = parse_response(response, width, height)                                                   
                                                                                                         
     return JSONResponse({                                                                              
         "blocks": blocks,                                                                              
-        "raw_response": response,                                                                      
+        "raw_response": layout_output,                                                                 
         "width": width,                                                                                
         "height": height,                                                                              
         "processing_time_ms": elapsed_ms,                                                              
     })                                                                                                 
                                                                                                         
                                                                                                         
-def parse_response(response: str, width: int, height: int) -> list:                                    
-    """Parse Dolphin response format: [x1,y1,x2,y2][type]text[/type][PAIR_SEP]..."""                   
-    blocks = []                                                                                        
-                                                                                                        
-    type_map = {                                                                                       
-        "para": "paragraph",                                                                           
-        "title": "title",                                                                              
-        "fig": "figure",                                                                               
-        "table": "table",                                                                              
-        "list": "list",                                                                                
-        "foot": "footer",                                                                              
-        "head": "header",                                                                              
-        "caption": "caption",                                                                          
-        "equation": "formula",                                                                         
-    }                                                                                                  
-                                                                                                        
-    parts = response.split("[PAIR_SEP]")                                                               
-                                                                                                        
-    for i, part in enumerate(parts):                                                                   
-        part = part.strip()                                                                            
-        if not part:                                                                                   
-            continue                                                                                   
-                                                                                                        
-        # Pattern with text: [x1,y1,x2,y2][type]text content[/type]                                    
-        pattern_with_text = r'\[(\d+),(\d+),(\d+),(\d+)\]\[(\w+)\](.*?)\[/\5\]'                        
-        match = re.match(pattern_with_text, part, re.DOTALL)                                           
-                                                                                                        
-        if match:                                                                                      
-            x1, y1, x2, y2, block_type, text = match.groups()                                          
-            text = text.strip()                                                                        
-        else:                                                                                          
-            # Fallback: try pattern without closing tag                                                
-            pattern_simple = r'\[(\d+),(\d+),(\d+),(\d+)\]\[(\w+)\](.*?)$'                             
-            match = re.match(pattern_simple, part, re.DOTALL)                                          
-                                                                                                        
-            if match:                                                                                  
-                x1, y1, x2, y2, block_type, text = match.groups()                                      
-                text = text.strip()                                                                    
-            else:                                                                                      
-                # Original pattern without text                                                        
-                pattern_no_text = r'\[(\d+),(\d+),(\d+),(\d+)\]\[(\w+)\]'                              
-                match = re.match(pattern_no_text, part)                                                
-                if match:                                                                              
-                    x1, y1, x2, y2, block_type = match.groups()                                        
-                    text = ""                                                                          
-                else:                                                                                  
-                    continue                                                                           
-                                                                                                        
-        normalized_type = type_map.get(block_type.lower(), block_type.lower())                         
-                                                                                                        
-        blocks.append({                                                                                
-            "id": i,                                                                                   
-            "type": normalized_type,                                                                   
-            "text": text,                                                                              
-            "bbox": [int(x1), int(y1), int(x2), int(y2)],                                              
-            "confidence": 1.0,                                                                         
-        })                                                                                             
-                                                                                                        
-    return blocks                                                                                      
-                                                                                                        
-                                                                                                        
 if __name__ == "__main__":                                                                             
     import uvicorn                                                                                     
-    uvicorn.run(app, host="0.0.0.0", port=8000)   
+    uvicorn.run(app, host="0.0.0.0", port=8000)  
+    
